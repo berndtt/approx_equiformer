@@ -5,7 +5,10 @@
     ```bash
         conda env create -f env/env_equiformer.yml
     ```
-    This will create a new environment called `equiformer`.
+    This will create a new environment called `equiformer` with Python 3.10, PyTorch 2.3 and CUDA 12.1, validated on both A100 and newer H200 GPUs.
+
+    If your system has a read-only package cache, set `CONDA_PKGS_DIRS` to a directory you own before running the command, e.g.
+    `CONDA_PKGS_DIRS=$HOME/conda_pkgs`.
 
 - We activate the environment:
     ```bash

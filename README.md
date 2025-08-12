@@ -32,7 +32,7 @@ Please refer to the [paper](https://arxiv.org/abs/2403.09549) and the [code](htt
 
 ### Environment 
 
-See [here](docs/env_setup.md) for setting up the environment.
+See [here](docs/env_setup.md) for setting up the environment. The provided configuration sets up Python 3.10 with PyTorch 2.3 and CUDA 12.1, and works on both A100 and H200 GPUs.
 
 
 ### QM9
