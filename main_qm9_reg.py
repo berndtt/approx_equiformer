@@ -27,10 +27,15 @@ from timm.utils import ModelEmaV2
 from timm.scheduler import create_scheduler
 from optim_factory import create_optimizer
 
-from engine import train_one_epoch, evaluate, compute_stats
+from engine_reg import train_one_epoch, evaluate, compute_stats
 
 # distributed training
 import utils
+
+from slurm_utils.utils import (
+    setup_logging, setup_wandb_for_hpc, get_data_dir,
+    safe_copy_dataset, file_lock, get_optimal_num_workers, get_optimal_precision
+)
 
 ModelEma = ModelEmaV2
 
@@ -97,7 +102,18 @@ def get_args_parser():
     parser.add_argument("--print-freq", type=int, default=100)
     # task
     parser.add_argument("--target", type=int, default=7)
-    parser.add_argument("--data-path", type=str, default='data/qm9')
+    #data
+    parser.add_argument("--data-path", type=str, default='data/qm9',
+                        help="Canonical/shared dataset location (source).")
+    parser.add_argument("--stage-local", action="store_true", dest="stage_local",
+                        help="Stage dataset into node-local $TMPDIR for fast I/O.")
+    parser.add_argument("--no-stage-local", action="store_false", dest="stage_local")
+    parser.set_defaults(stage_local=True)
+    parser.add_argument("--stage-from", type=str, default=None,
+                        help="Optional source dir to stage from (overrides --data-path).")
+    parser.add_argument("--data-subdir", type=str, default="qm9",
+                        help="Subdirectory name under local scratch.")
+    
     parser.add_argument('--feature-type', type=str, default='one_hot')
     parser.add_argument('--compute-stats', action='store_true', dest='compute_stats')
     parser.set_defaults(compute_stats=False)
@@ -122,6 +138,18 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
+
+    # equivariance regularization
+    parser.add_argument('--eq-reg-non', type=float, default=0.0,
+                        help='lambda_non: weight for ||W - W_eq||_F penalty (encourage equivariance).')
+    parser.add_argument('--eq-reg-eq', type=float, default=0.0,
+                        help='lambda_eq: weight for ||W_eq||_F penalty (shrink equivariant part if desired).')
+    parser.add_argument('--eq-reg-power', type=int, default=2, choices=[1, 2],
+                        help='Use L1 or L2 on penalty norms (default: 2).')
+    parser.add_argument('--eq-reg-where', type=str, default='relaxed-linear',
+                        choices=['relaxed-linear', 'all'],
+                        help="Where to apply: 'relaxed-linear' = only RelaxedLinearRS (default); 'all' reserved.")
+
     return parser
 
 
@@ -130,16 +158,40 @@ def main(args):
     utils.init_distributed_mode(args)
     is_main_process = (args.rank == 0)
 
+    # Keep logs quiet and send W&B to node-local scratch (no NFS thrash)
+    setup_logging("warning")
+    setup_wandb_for_hpc()
+
+    # Decide where to read data from:
+    # - If staging: copy once per node into $TMPDIR/shared_data/<data-subdir>
+    # - else: use args.data_path directly
+    if args.stage_local:
+        local_root = os.path.join(get_data_dir(), args.data_subdir)   # e.g., $TMPDIR/shared_data/qm9
+        os.makedirs(local_root, exist_ok=True)
+
+        src = args.stage_from if args.stage_from is not None else args.data_path
+        # Copy the (already downloaded) dataset tree once per node, if present.
+        # If you want to allow "download from internet", keep src missing; the dataset class will fetch.
+        if os.path.isdir(src):
+            safe_copy_dataset(src, local_root)  # locked & idempotent
+
+        data_root = local_root
+    else:
+        data_root = args.data_path
+        
     _log = FileLogger(is_master=is_main_process, is_rank0=is_main_process, output_dir=args.output_dir)
     _log.info(args)
     
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    ''' Dataset '''
-    train_dataset = QM9(args.data_path, 'train', feature_type=args.feature_type)
-    val_dataset   = QM9(args.data_path, 'valid', feature_type=args.feature_type)
-    test_dataset  = QM9(args.data_path, 'test', feature_type=args.feature_type)
+    ''' Dataset (locked build to avoid race conditions on first use) '''
+    lock_path = os.path.join(data_root, ".qm9_build.lock")
+    with file_lock(lock_path):
+        train_dataset = QM9(data_root, 'train', feature_type=args.feature_type)
+        val_dataset   = QM9(data_root, 'valid', feature_type=args.feature_type)
+        test_dataset  = QM9(data_root, 'test',  feature_type=args.feature_type)
+
     _log.info('Training set mean: {}, std:{}'.format(
         train_dataset.mean(args.target), train_dataset.std(args.target)))
     # calculate dataset stats
@@ -182,6 +234,8 @@ def main(args):
     _log.info('Number of params: {}'.format(n_parameters))
     
     ''' Optimizer and LR Scheduler '''
+    # Assume you pass args into train_one_epoch; if not, capture lambdas some other way.
+
     optimizer = create_optimizer(args, model)
     lr_scheduler, _ = create_scheduler(args, optimizer)
     criterion = None #torch.nn.MSELoss() #torch.nn.L1Loss() # torch.nn.MSELoss() 
@@ -201,16 +255,19 @@ def main(args):
         loss_scaler = NativeScaler()
     
     ''' Data Loader '''
+
+    num_workers = get_optimal_num_workers(args.batch_size, len(train_dataset))
+
     if args.distributed:
         sampler_train = torch.utils.data.DistributedSampler(
                 train_dataset, num_replicas=utils.get_world_size(), rank=utils.get_rank(), shuffle=True
             )
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
-            sampler=sampler_train, num_workers=args.workers, pin_memory=args.pin_mem, 
+            sampler=sampler_train, num_workers=num_workers, pin_memory=args.pin_mem, 
             drop_last=True)
     else:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
-            shuffle=True, num_workers=args.workers, pin_memory=args.pin_mem, 
+            shuffle=True, num_workers=num_workers, pin_memory=args.pin_mem, 
             drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
@@ -236,7 +293,10 @@ def main(args):
             target=args.target, data_loader=train_loader, optimizer=optimizer,
             device=device, epoch=epoch, model_ema=model_ema, 
             amp_autocast=amp_autocast, loss_scaler=loss_scaler,
-            print_freq=args.print_freq, logger=_log)
+            print_freq=args.print_freq, logger=_log,
+            eq_reg_non=args.eq_reg_non, eq_reg_eq=args.eq_reg_eq,
+            eq_reg_power=args.eq_reg_power, eq_reg_where=args.eq_reg_where
+        )
         
         val_err, val_loss = evaluate(model, norm_factor, args.target, val_loader, device, 
             amp_autocast=amp_autocast, print_freq=args.print_freq, logger=_log)
@@ -295,6 +355,7 @@ if __name__ == "__main__":
     import warnings
 
     warnings.filterwarnings("ignore")
+
 
     parser = argparse.ArgumentParser('Training equivariant networks', parents=[get_args_parser()])
     args = parser.parse_args()  

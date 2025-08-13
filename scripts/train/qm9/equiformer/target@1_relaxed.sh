@@ -11,8 +11,8 @@ conda activate equiformer_new
 
 
 torchrun --standalone --nproc_per_node=1 main_qm9.py \
-    --output-dir 'models/qm9/equiformer/se_l2/target@1/' \
-    --model-name 'graph_attention_transformer_nonlinear_l2' \
+    --output-dir 'models/qm9/equiformer_relaxed/se_l2/target@1/' \
+    --model-name 'graph_attention_transformer_nonlinear_l2_relaxed' \
     --input-irreps '5x0e' \
     --target 1 \
     --data-path 'datasets/qm9' \
@@ -20,6 +20,7 @@ torchrun --standalone --nproc_per_node=1 main_qm9.py \
     --batch-size 128 \
     --radius 5.0 \
     --num-basis 128 \
+    --drop-path 0.0 \
     --drop-path 0.0 \
     --weight-decay 5e-3 \
     --lr 5e-4 \
